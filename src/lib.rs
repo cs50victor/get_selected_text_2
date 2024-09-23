@@ -14,9 +14,9 @@ use objc2_foundation::NSArray;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SelectedText {
-    is_file_paths: bool,
-    app_name: String,
-    text: Vec<String>,
+    pub is_file_paths: bool,
+    pub app_name: String,
+    pub text: Vec<String>,
 }
 pub struct PasteboardSavedState {
     pub saved_change_count: isize,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use accessibility_ng::{AXAttribute, AXUIElement};
 use accessibility_sys_ng::{kAXFocusedUIElementAttribute, kAXSelectedTextAttribute};
 use active_win_pos_rs::get_active_window;
@@ -7,6 +9,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use log::error;
+use objc2::rc::Retained;
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString};
 
 use anyhow::{anyhow, bail};
@@ -27,6 +30,14 @@ pub enum GetSelectedTextResult {
     Text(SelectedText),
     PasteboardState(PasteboardSavedState),
 }
+
+#[derive(Clone)]
+pub struct PasteBoardContainer {
+    pub inner: Arc<objc2::rc::Retained<NSPasteboard>>,
+    pub pasteboard: Option<Retained<NSArray<NSPasteboardItem>>>,
+}
+unsafe impl Send for PasteBoardContainer {}
+unsafe impl Sync for PasteBoardContainer {}
 
 const CMD_KEY: CGKeyCode = core_graphics::event::KeyCode::COMMAND;
 const KEY_C: CGKeyCode = 8;
@@ -107,10 +118,11 @@ pub fn ctrl_c_and_save_pasteboard(
 
 #[cfg(target_os = "macos")]
 pub fn get_selected_text_from_pasteboard(
+    app_name: String,
     pasteboard: &objc2::rc::Retained<NSPasteboard>,
     saved_change_count: isize,
     saved_contents: Option<objc2::rc::Retained<NSArray<NSPasteboardItem>>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SelectedText> {
     use log::info;
     use objc2::runtime::ProtocolObject;
 
@@ -127,7 +139,11 @@ pub fn get_selected_text_from_pasteboard(
     if new_change_count == saved_change_count {
         println!("User didn't select any text or pasteboard took too long to update");
         info!("User didn't select any text or pasteboard took too long to update");
-        return Ok(String::new());
+        return Ok(SelectedText {
+            is_file_paths: false,
+            app_name: app_name.clone(),
+            text: vec![String::new()],
+        });
     }
     let copied_text = unsafe { pasteboard.stringForType(NSPasteboardTypeString) };
     println!("copied_text: {:?}", copied_text);
@@ -154,7 +170,11 @@ pub fn get_selected_text_from_pasteboard(
             }
         }
     }
-    Ok(copied_text.map(|t| t.to_string()).unwrap_or_default())
+    Ok(SelectedText {
+        is_file_paths: false,
+        app_name: app_name.clone(),
+        text: vec![copied_text.map(|t| t.to_string()).unwrap_or_default()],
+    })
 }
 
 pub fn get_window_meta() -> (String, String) {
@@ -348,16 +368,12 @@ fn _selected_text(
     match get_selected_text_using_ax_then_copy(app_name.clone(), &pasteboard)? {
         GetSelectedTextResult::Text(selected_text) => Ok(selected_text),
         GetSelectedTextResult::PasteboardState(mut pasteboard_saved_state) => {
-            let copied_text = get_selected_text_from_pasteboard(
+            get_selected_text_from_pasteboard(
+                app_name.clone(),
                 &pasteboard,
                 pasteboard_saved_state.saved_change_count,
                 pasteboard_saved_state.saved_contents.take(),
-            )?;
-            Ok(SelectedText {
-                is_file_paths: false,
-                app_name: app_name.clone(),
-                text: vec![copied_text.to_owned()],
-            })
+            )
         }
     }
 }

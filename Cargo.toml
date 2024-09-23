@@ -1,0 +1,20 @@
+[package]
+name = "get_selected_text_2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+accessibility-ng = "0.1.6"
+accessibility-sys-ng = "0.1.3"
+active-win-pos-rs = "0.8.3"
+anyhow = "1.0.89"
+cocoa = "0.26.0"
+core-foundation = { version = "0.9.3", features = ["mac_os_10_7_support", "mac_os_10_8_features"] }
+core-graphics = "0.22.3"
+log = "0.4.22"
+lru = "0.12.4"
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = "0.2.2"
+parking_lot = "0.12.3"
+serde = { version = "1.0", features = ["derive"] }

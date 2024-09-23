@@ -1,14 +1,16 @@
-use std::num::NonZeroUsize;
-
 use accessibility_ng::{AXAttribute, AXUIElement};
 use accessibility_sys_ng::{kAXFocusedUIElementAttribute, kAXSelectedTextAttribute};
 use active_win_pos_rs::get_active_window;
 use core_foundation::string::CFString;
-use core_graphics::{event::{CGEvent, CGEventTapLocation, CGKeyCode}, event_source::{CGEventSource, CGEventSourceStateID}};
+use core_graphics::{
+    event::{CGEvent, CGEventTapLocation, CGKeyCode},
+    event_source::{CGEventSource, CGEventSourceStateID},
+};
 use log::error;
-use lru::LruCache;
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-use parking_lot::Mutex;
+use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString};
+
+use anyhow::{anyhow, bail};
+use objc2_foundation::NSArray;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SelectedText {
@@ -16,16 +18,22 @@ pub struct SelectedText {
     app_name: String,
     text: Vec<String>,
 }
+pub struct PasteboardSavedState {
+    pub saved_change_count: isize,
+    pub saved_contents: Option<objc2::rc::Retained<NSArray<NSPasteboardItem>>>,
+}
 
-static GET_SELECTED_TEXT_METHOD: Mutex<Option<LruCache<String, u8>>> = Mutex::new(None);
-
-use anyhow::{anyhow, bail};
+pub enum GetSelectedTextResult {
+    Text(SelectedText),
+    PasteboardState(PasteboardSavedState),
+}
 
 const CMD_KEY: CGKeyCode = core_graphics::event::KeyCode::COMMAND;
 const KEY_C: CGKeyCode = 8;
 
 pub fn simulate(key: CGKeyCode, key_down: bool) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| anyhow!("Failed to create CGEventSource"))?;
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow!("Failed to create CGEventSource"))?;
     if let Some(cg_event) = CGEvent::new_keyboard_event(source, key, key_down).ok() {
         cg_event.post(CGEventTapLocation::HID);
         // Let ths MacOS catchup
@@ -33,7 +41,7 @@ pub fn simulate(key: CGKeyCode, key_down: bool) -> anyhow::Result<()> {
         Ok(())
     } else {
         bail!("Failed to simulate key press event for spotlight selected text copy")
-    }   
+    }
 }
 
 // KeyPress(Key),
@@ -41,51 +49,108 @@ pub fn simulate(key: CGKeyCode, key_down: bool) -> anyhow::Result<()> {
 // reference - https://github.com/Narsil/rdev/blob/main/src/macos/keycodes.rs
 pub fn sim_ctrl_c() -> anyhow::Result<()> {
     // keydown
+    println!("keydown cmd");
     simulate(CMD_KEY, true)?;
-    // keyup
-    simulate(CMD_KEY, false)?;
     // keydown
+    println!("keydown c");
     simulate(KEY_C, true)?;
     // keyup
+    println!("key up c");
     simulate(KEY_C, false)?;
+    // keyup
+    println!("key up cmd");
+    simulate(CMD_KEY, false)?;
     Ok(())
 }
 
+const QUIET_CMD_C: &str = r#"
+tell application "System Events"
+    set savedAlertVolume to alert volume of (get volume settings)
+    set volume alert volume 0
+    keystroke "c" using {command down}
+    set volume alert volume savedAlertVolume
+end tell
+"#;
+
+fn quiet_cmd_c() -> anyhow::Result<()> {
+    // debug_println!("get_selected_text_by_clipboard_using_applescript");
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(QUIET_CMD_C)
+        .output()?;
+    // .spawn()?;
+
+    if !output.status.success() {
+        bail!(output
+            .stderr
+            .into_iter()
+            .map(|c| c as char)
+            .collect::<String>());
+    }
+    Ok(())
+}
+
+pub fn ctrl_c_and_save_pasteboard(
+    pasteboard: &objc2::rc::Retained<NSPasteboard>,
+) -> anyhow::Result<PasteboardSavedState> {
+    let saved_change_count = unsafe { pasteboard.changeCount() };
+    let saved_contents = unsafe { pasteboard.pasteboardItems() };
+
+    sim_ctrl_c()?;
+    // quiet_cmd_c()?;
+
+    Ok(PasteboardSavedState {
+        saved_change_count,
+        saved_contents,
+    })
+}
 
 #[cfg(target_os = "macos")]
-pub fn get_selected_text_by_copy() -> anyhow::Result<String>{
+pub fn get_selected_text_from_pasteboard(
+    pasteboard: &objc2::rc::Retained<NSPasteboard>,
+    saved_change_count: isize,
+    saved_contents: Option<objc2::rc::Retained<NSArray<NSPasteboardItem>>>,
+) -> anyhow::Result<String> {
+    use log::info;
     use objc2::runtime::ProtocolObject;
-    use objc2_foundation::NSArray;
 
-    let pasteboard = unsafe {NSPasteboard::generalPasteboard()};
-    let saved_change_count = unsafe {pasteboard.changeCount()};
-    let saved_contents = unsafe {pasteboard.pasteboardItems()};
-    
-    sim_ctrl_c()?;
-    
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(200);
+    let timeout = std::time::Duration::from_millis(90);
     let mut new_change_count = saved_change_count;
     while new_change_count == saved_change_count {
         if start_time.elapsed() > timeout {
-            anyhow::bail!("Timeout waiting for pasteboard to update");
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
         new_change_count = unsafe { pasteboard.changeCount() };
     }
-    let copied_text =  unsafe { pasteboard.stringForType(NSPasteboardTypeString) };
+    if new_change_count == saved_change_count {
+        println!("User didn't select any text or pasteboard took too long to update");
+        info!("User didn't select any text or pasteboard took too long to update");
+        return Ok(String::new());
+    }
+    let copied_text = unsafe { pasteboard.stringForType(NSPasteboardTypeString) };
+    println!("copied_text: {:?}", copied_text);
+    println!("new_change_count: {:?}", new_change_count);
+    println!("saved_change_count: {:?}", saved_change_count);
     unsafe {
         if let Some(prev_contents) = saved_contents {
             pasteboard.clearContents();
             let max = prev_contents.count();
-            let mut objs = Vec::with_capacity(max+10);
-            for i in 0..max {
-                objs.push(ProtocolObject::from_retained(prev_contents.objectAtIndex(i)));
-            }
+            println!("max: {:?}", max);
+            println!("prev_contents: {:?}", prev_contents.lastObject());
+            if max > 1 {
+                let mut objs = Vec::with_capacity(max + 10);
+                for i in 0..max - 1 {
+                    objs.push(ProtocolObject::from_retained(
+                        prev_contents.objectAtIndex(i),
+                    ));
+                }
 
-            let res = pasteboard.writeObjects(&NSArray::from_vec(objs)) ;
-            if !res {
-                bail!("Failed to write objects to pasteboard");
+                let res = pasteboard.writeObjects(&NSArray::from_vec(objs));
+                if !res {
+                    bail!("Failed to write objects to pasteboard");
+                }
             }
         }
     }
@@ -102,81 +167,59 @@ pub fn get_window_meta() -> (String, String) {
     }
 }
 
-pub fn in_finder_or_empty_window() -> bool {
+pub fn in_finder_or_empty_window() -> (bool, String) {
     let (app_name, _) = get_window_meta();
-    app_name == "Finder" || app_name == "Empty Window"
+    (app_name == "Finder" || app_name == "Empty Window", app_name)
 }
 
-
-pub fn get_selected_text() -> anyhow::Result<SelectedText> {
-    if GET_SELECTED_TEXT_METHOD.lock().is_none() {
-        let cache = LruCache::new(NonZeroUsize::new(100).unwrap());
-        *GET_SELECTED_TEXT_METHOD.lock() = Some(cache);
-    }
-    let mut cache = GET_SELECTED_TEXT_METHOD.lock();
-    let cache = cache.as_mut().unwrap();
-    
-    let (app_name, window_title) = get_window_meta();
-
-    let no_active_app = app_name == "Empty Window";
-    if app_name == "Finder" || no_active_app {
-        match get_selected_file_paths_by_clipboard_using_applescript(no_active_app) {
-            Ok(text) => {
-                println!("file paths: {:?}", text.split("\n"));
-                return Ok(SelectedText {
-                    is_file_paths: true,
-                    app_name,
-                    text: text.split("\n").map(|t| t.to_owned()).collect::<Vec<String>>(),
-                });
-            }
-            Err(e) => {
-                error!("get_selected_file_paths_by_clipboard_using_applescript failed: {:?}", e);
-            }
+pub fn get_selected_files(window_name: &str) -> anyhow::Result<SelectedText> {
+    let no_active_app = window_name == "Empty Window";
+    match get_selected_file_paths_by_clipboard_using_applescript(no_active_app) {
+        Ok(text) => {
+            println!("file paths: {:?}", text.split("\n"));
+            return Ok(SelectedText {
+                is_file_paths: true,
+                app_name: window_name.to_owned(),
+                text: text
+                    .split("\n")
+                    .map(|t| t.to_owned())
+                    .collect::<Vec<String>>(),
+            });
+        }
+        Err(e) => {
+            bail!(
+                "get_selected_file_paths_by_clipboard_using_applescript failed: {:?}",
+                e
+            );
         }
     }
-
+}
+pub fn get_selected_text_using_ax_then_copy(
+    app_name: String,
+    pasteboard: &objc2::rc::Retained<NSPasteboard>,
+) -> anyhow::Result<GetSelectedTextResult> {
     let mut selected_text = SelectedText {
         is_file_paths: false,
         app_name: app_name.clone(),
         text: vec![],
     };
 
-    if let Some(text) = cache.get(&app_name) {
-        if *text == 0 {
-            let ax_text = get_selected_text_by_ax()?;
-            if !ax_text.is_empty() {
-                cache.put(app_name.clone(), 0);
-                selected_text.text = vec![ax_text];
-                return Ok(selected_text);
-            }
-        }
-        let txt = get_selected_text_by_copy()?;
-        selected_text.text = vec![txt];
-        return Ok(selected_text);
-    }
     match get_selected_text_by_ax() {
         Ok(txt) => {
-            if !txt.is_empty() {
-                cache.put(app_name.clone(), 0);
-            }
             selected_text.text = vec![txt];
-            Ok(selected_text)
+            Ok(GetSelectedTextResult::Text(selected_text))
         }
-        Err(_) => match get_selected_text_by_copy() {
-            Ok(txt) => {
-                if !txt.is_empty() {
-                    cache.put(app_name, 1);
-                }
-                selected_text.text = vec![txt];
-                Ok(selected_text)
-            }
-            Err(e) => bail!(e),
-        },
+        Err(e) => {
+            error!("get_selected_text_by_ax failed: {:?}", e);
+            Ok(GetSelectedTextResult::PasteboardState(
+                ctrl_c_and_save_pasteboard(pasteboard)?,
+            ))
+        }
     }
 }
 
 fn get_selected_text_by_ax() -> anyhow::Result<String> {
-    // debug_println!("get_selected_text_by_ax");
+    log::info!("get_selected_text_by_ax");
     let system_element = AXUIElement::system_wide();
     let Some(selected_element) = system_element
         .attribute(&AXAttribute::new(&CFString::from_static_string(
@@ -200,7 +243,6 @@ fn get_selected_text_by_ax() -> anyhow::Result<String> {
     };
     Ok(selected_text.to_string())
 }
-
 
 const FILE_PATH_COPY_APPLE_SCRIPT: &str = r#"
 tell application "Finder"
@@ -269,10 +311,10 @@ on replace_chars(this_text, search_string, replacement_string)
 end replace_chars
 "#;
 
-
-fn get_selected_file_paths_by_clipboard_using_applescript(for_empty_window: bool
+fn get_selected_file_paths_by_clipboard_using_applescript(
+    for_empty_window: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // debug_println!("get_selected_text_by_clipboard_using_applescript");
+    log::info!("get_selected_text_by_clipboard_using_applescript");
     let mut binding = std::process::Command::new("osascript");
     let cmd = binding.arg("-e");
 
@@ -299,22 +341,54 @@ fn get_selected_file_paths_by_clipboard_using_applescript(for_empty_window: bool
     }
 }
 
+fn _selected_text(
+    app_name: String,
+    pasteboard: &objc2::rc::Retained<NSPasteboard>,
+) -> anyhow::Result<SelectedText> {
+    match get_selected_text_using_ax_then_copy(app_name.clone(), &pasteboard)? {
+        GetSelectedTextResult::Text(selected_text) => Ok(selected_text),
+        GetSelectedTextResult::PasteboardState(mut pasteboard_saved_state) => {
+            let copied_text = get_selected_text_from_pasteboard(
+                &pasteboard,
+                pasteboard_saved_state.saved_change_count,
+                pasteboard_saved_state.saved_contents.take(),
+            )?;
+            Ok(SelectedText {
+                is_file_paths: false,
+                app_name: app_name.clone(),
+                text: vec![copied_text.to_owned()],
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_get_selected_text() {
+        let dummy_app_name = "Dummy App".to_owned();
+        let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
         println!("--- get_selected_text ---");
-        let text = get_selected_text().unwrap();
+        let mut start = std::time::Instant::now();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let elapsed = start.elapsed();
+        println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
         println!("--- get_selected_text ---");
-        let text = get_selected_text().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        start = std::time::Instant::now();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let elapsed = start.elapsed();
+        println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
         println!("--- get_selected_text ---");
-        let text = get_selected_text().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        start = std::time::Instant::now();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let elapsed = start.elapsed();
+        println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
     }
-    
-
 }

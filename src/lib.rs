@@ -103,12 +103,16 @@ fn quiet_cmd_c() -> anyhow::Result<()> {
 
 pub fn ctrl_c_and_save_pasteboard(
     pasteboard: &objc2::rc::Retained<NSPasteboard>,
+    use_applescript: bool,
 ) -> anyhow::Result<PasteboardSavedState> {
     let saved_change_count = unsafe { pasteboard.changeCount() };
     let saved_contents = unsafe { pasteboard.pasteboardItems() };
 
-    sim_ctrl_c()?;
-    // quiet_cmd_c()?;
+    if use_applescript {
+        quiet_cmd_c()?;
+    } else {
+        sim_ctrl_c()?;
+    }
 
     Ok(PasteboardSavedState {
         saved_change_count,
@@ -122,12 +126,13 @@ pub fn get_selected_text_from_pasteboard(
     pasteboard: &objc2::rc::Retained<NSPasteboard>,
     saved_change_count: isize,
     saved_contents: Option<objc2::rc::Retained<NSArray<NSPasteboardItem>>>,
+    pasteboard_wait_timeout: u64,
 ) -> anyhow::Result<SelectedText> {
     use log::info;
     use objc2::runtime::ProtocolObject;
 
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_millis(90);
+    let timeout = std::time::Duration::from_millis(pasteboard_wait_timeout);
     let mut new_change_count = saved_change_count;
     while new_change_count == saved_change_count {
         if start_time.elapsed() > timeout {
@@ -217,6 +222,7 @@ pub fn get_selected_files(window_name: &str) -> anyhow::Result<SelectedText> {
 pub fn get_selected_text_using_ax_then_copy(
     app_name: String,
     pasteboard: &objc2::rc::Retained<NSPasteboard>,
+    use_apple_script: bool,
 ) -> anyhow::Result<GetSelectedTextResult> {
     let mut selected_text = SelectedText {
         is_file_paths: false,
@@ -232,7 +238,7 @@ pub fn get_selected_text_using_ax_then_copy(
         Err(e) => {
             error!("get_selected_text_by_ax failed: {:?}", e);
             Ok(GetSelectedTextResult::PasteboardState(
-                ctrl_c_and_save_pasteboard(pasteboard)?,
+                ctrl_c_and_save_pasteboard(pasteboard, use_apple_script)?,
             ))
         }
     }
@@ -364,8 +370,9 @@ fn get_selected_file_paths_by_clipboard_using_applescript(
 fn _selected_text(
     app_name: String,
     pasteboard: &objc2::rc::Retained<NSPasteboard>,
+    use_apple_script: bool,
 ) -> anyhow::Result<SelectedText> {
-    match get_selected_text_using_ax_then_copy(app_name.clone(), &pasteboard)? {
+    match get_selected_text_using_ax_then_copy(app_name.clone(), &pasteboard, use_apple_script)? {
         GetSelectedTextResult::Text(selected_text) => Ok(selected_text),
         GetSelectedTextResult::PasteboardState(mut pasteboard_saved_state) => {
             get_selected_text_from_pasteboard(
@@ -373,6 +380,7 @@ fn _selected_text(
                 &pasteboard,
                 pasteboard_saved_state.saved_change_count,
                 pasteboard_saved_state.saved_contents.take(),
+                90,
             )
         }
     }
@@ -384,25 +392,26 @@ mod tests {
 
     #[test]
     fn test_get_selected_text() {
+        const USE_APPLE_SCRIPT: bool = false;
         let dummy_app_name = "Dummy App".to_owned();
         let pasteboard = unsafe { NSPasteboard::generalPasteboard() };
         println!("--- get_selected_text ---");
         let mut start = std::time::Instant::now();
-        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard, USE_APPLE_SCRIPT).unwrap();
         let elapsed = start.elapsed();
         println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
         println!("--- get_selected_text ---");
         std::thread::sleep(std::time::Duration::from_millis(1000));
         start = std::time::Instant::now();
-        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard, USE_APPLE_SCRIPT).unwrap();
         let elapsed = start.elapsed();
         println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
         println!("--- get_selected_text ---");
         std::thread::sleep(std::time::Duration::from_millis(1000));
         start = std::time::Instant::now();
-        let text = _selected_text(dummy_app_name.clone(), &pasteboard).unwrap();
+        let text = _selected_text(dummy_app_name.clone(), &pasteboard, USE_APPLE_SCRIPT).unwrap();
         let elapsed = start.elapsed();
         println!("Time elapsed: {} ms", elapsed.as_millis());
         println!("selected text: {:#?}", text);
